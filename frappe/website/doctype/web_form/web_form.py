@@ -454,6 +454,18 @@ def get_context(context):
 			context.reference_doctype = context.reference_doc.doctype
 			context.reference_name = context.reference_doc.name
 
+			# A user viewing a submission may have access through the web form's own
+			# permission model (e.g. document owner) without holding standard print
+			# permission on the doctype. The print view rejects such users, so pass them
+			# a document share key (which it accepts) and the print button works. Users
+			# who already have print permission don't need one. See #19160.
+			if (
+				self.allow_print
+				and context.in_view_mode
+				and not frappe.has_permission(self.doc_type, "print", context.reference_doc)
+			):
+				context.print_key = get_print_share_key(context.reference_doc)
+
 			if self.show_attachments:
 				context.attachments = self.get_webform_attachments(context)
 
@@ -590,6 +602,33 @@ def process_link_field(field, web_form_name):
 	return field
 
 
+def get_print_share_key(doc):
+	"""Return a document share key for printing `doc` via the web form.
+
+	Reuses an existing, non-expired key instead of inserting a new record on every
+	view (a fresh key per request/day would accumulate unboundedly).
+
+	The web form is served over a GET request, which the framework rolls back by
+	default. When a new key is created, flag the request to commit so the key
+	persists for the subsequent print-view request (otherwise printing 403s).
+	"""
+	key = frappe.db.get_value(
+		"Document Share Key",
+		{
+			"reference_doctype": doc.doctype,
+			"reference_docname": doc.name,
+			"expires_on": [">=", frappe.utils.today()],
+		},
+		"key",
+	)
+	if key:
+		return key
+
+	key = doc.get_document_share_key()
+	frappe.flags.commit = True
+	return key
+
+
 def get_web_form_module(doc):
 	if doc.is_standard:
 		return get_doc_module(doc.module, doc.doctype, doc.name)
@@ -699,6 +738,16 @@ def accept(web_form, data):
 		frappe.session.user = user
 
 	frappe.flags.web_form_doc = doc
+
+	if web_form.allow_print and doc.name:
+		# Return a document share key so the submitter can print their submission from
+		# the success page, even on anonymous/public forms where they hold no print
+		# permission. accept() is a POST, so the key is committed. See #19160.
+		response = doc.as_dict()
+		response["print_key"] = get_print_share_key(doc)
+		response["print_format"] = web_form.print_format or "Standard"
+		return response
+
 	return doc
 
 
